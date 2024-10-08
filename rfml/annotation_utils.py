@@ -7,6 +7,7 @@ from cupyx.scipy.signal import spectrogram as cupyx_spectrogram
 from cupyx.scipy.ndimage import gaussian_filter as cupyx_gaussian_filter
 import cupyx.scipy.signal
 import scipy.signal
+import scipy.stats
 
 from rfml.spectrogram import *
 
@@ -18,7 +19,13 @@ from pathlib import Path
 from tqdm import tqdm
 from sklearn import mixture
 import warnings
+import torch
+import json
+import torchsig.transforms as ST
+from torchsig.models.iq_models.efficientnet.efficientnet import efficientnet_b0
 
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def annotate(
     data_obj,
@@ -38,7 +45,14 @@ def annotate(
     n_components=None,
     n_init=1,
     fft_len=256,
+    model_file=None,
+    index_to_name_file=None,
+    model_input_length=1024,
 ):
+    global_start = time.time()
+    if model_file is not None and index_to_name_file is None:
+        raise ValueError
+    
 
     sample_rate = data_obj.metadata["global"]["core:sample_rate"]
 
@@ -80,15 +94,41 @@ def annotate(
         )
 
     # if overwrite, delete existing annotations
-    if overwrite:
+    if not dry_run and overwrite:
         data_obj.sigmf_obj._metadata[data_obj.sigmf_obj.ANNOTATION_KEY] = []
 
     if n_components is None:
         n_components = len(labels) + 1 if labels else 2
 
     n_annotations = 0
-    for sample_idx in tqdm(sample_idxs):
 
+    if model_file: 
+        
+        # TODO: get class mapping, load index_to_name.json 
+        with open(index_to_name_file) as f:
+            label_to_name = json.load(f)
+            
+        model = efficientnet_b0(num_classes=len(label_to_name))
+        model.load_state_dict(torch.load(model_file, weights_only=True))
+
+        # TODO: load model
+        # model = torch.jit.load(model_file)
+
+
+        model = model.to(device)
+        model.eval()
+
+        # TODO: define transform 
+        # transform = 
+        transform = ST.Compose(
+            [
+                # ST.Normalize(norm=2),
+                ST.Normalize(norm=np.inf),
+                ST.ComplexTo2D(),
+            ]
+        )
+
+    for sample_idx in tqdm(sample_idxs):
         if n_samples > -1:
             get_n_samples = min(
                 sample_rate * power_estimate_duration,
@@ -111,61 +151,80 @@ def annotate(
             iq_samples, type="linear", bp=np.arange(0, len(iq_samples), 1024)  # 1024)
         )
 
+        avg_pwr = moving_average(iq_samples, avg_window_len)
+        avg_pwr_db = 10 * np.log10(avg_pwr)
+        
         if force_threshold_db:
             threshold_db = force_threshold_db
         else:
-            avg_pwr = moving_average(iq_samples, avg_window_len)
-            avg_pwr_db = 10 * np.log10(avg_pwr)
-            del avg_pwr
-
-            # current threshold in custom_handler
-            guess_threshold_old = (np.max(avg_pwr_db) + np.mean(avg_pwr_db)) / 2
-            mad = median_absolute_deviation(avg_pwr_db)
-
-            tqdm.write(
-                f"Estimating noise floor for signal detection (may take a while)..."
-            )
-
-            clf = mixture.GaussianMixture(n_components=n_components, n_init=n_init)
-            clf.fit(avg_pwr_db.reshape(-1, 1))
-            # TODO: add standard deviation parameter (was 2 *)
-            gaussian_mixture_model_estimate = np.min(clf.means_) + 2 * np.sqrt(
-                clf.covariances_[np.argmin(clf.means_)].squeeze()
-            )
-
+            # NOISE FLOOR ESTIMATION
+            start_time = time.time()
             if verbose:
-                print(f"\n{gaussian_mixture_model_estimate=}")
-                print(f"{clf.weights_=}")
-                print(f"{clf.means_=}")
-                print(f"{clf.covariances_=}")
-                print(f"{clf.converged_=}\n")
+                tqdm.write(
+                    f"Estimating noise floor for signal detection (may take a while)..."
+                )
 
-            threshold_db = gaussian_mixture_model_estimate
+            heuristic = (np.max(avg_pwr_db) + np.mean(avg_pwr_db)) / 2
+            mad = median_absolute_deviation(avg_pwr_db)
+            madm = mean_absolute_deviation_minimum(avg_pwr_db)
+            medadm = median_absolute_deviation_minimum(avg_pwr_db)
+            
+            # clf = mixture.GaussianMixture(n_components=n_components, n_init=n_init)
+            # clf.fit(avg_pwr_db.reshape(-1, 1))
+            # # TODO: add standard deviation parameter (DEFAULT 2 *)
+            # gaussian_mixture_model_estimate = np.min(clf.means_) + 2 * np.sqrt(
+            #     clf.covariances_[np.argmin(clf.means_)].squeeze()
+            # )
+            # threshold_db = gaussian_mixture_model_estimate
 
+            threshold_db = madm
+            if verbose:
+                tqdm.write(f"noise floor estimation took {time.time()-start_time} seconds")
+
+
+            
+
+            # VERBOSE
+            # if verbose:
+            #     print(f"\n{gaussian_mixture_model_estimate=}")
+            #     print(f"{clf.weights_=}")
+            #     print(f"{clf.means_=}")
+            #     print(f"{clf.covariances_=}")
+            #     print(f"{clf.converged_=}\n")
+
+            # DEBUG
             if debug:
                 print(f"Debug")
                 debug_plot(
+                    iq_samples,
                     avg_pwr_db,
                     mad,
                     threshold_db,
                     debug_duration,
                     data_obj,
-                    guess_threshold_old,
+                    heuristic,
                     force_threshold_db,
                     n_components=n_components,
+                    fft_len=fft_len,
+                    madm=madm,
+                    medadm=medadm,
                 )
+        if verbose:
+            tqdm.write(
+                f"Using dB threshold = {threshold_db} for detecting signals to annotate"
+            )
 
-        tqdm.write(
-            f"Using dB threshold = {threshold_db} for detecting signals to annotate"
-        )
+        good_samples = np.zeros(len(iq_samples))
+        good_samples[np.where(avg_pwr_db > threshold_db)] = 1
 
-        # apply power squelch to I/Q samples using dB threshold
-        idx = power_squelch(
-            iq_samples, threshold=threshold_db, avg_window_len=avg_window_len
-        )
+        idx = (
+            np.ediff1d(np.r_[0, good_samples == 1, 0]).nonzero()[0].reshape(-1, 2)
+        )  # gets indices where signal power above threshold
+
+        
+        start_annotation_time = time.time()
 
         for start, stop in tqdm(idx[:max_annotations]):
-
             candidate_labels = list(labels.keys())
 
             start, stop = int(start), int(stop)
@@ -251,6 +310,7 @@ def annotate(
                         )
                     continue
 
+                start_get_bandwidth = time.time()
                 freq_edges = get_bandwidth(
                     data_obj,
                     iq_samples,
@@ -261,6 +321,7 @@ def annotate(
                     debug,
                     fft_len=fft_len,
                 )
+                # tqdm.write(f"{time.time()-start_get_bandwidth} seconds for bandwidth estimation")
 
             freq_lower_edge, freq_upper_edge = freq_edges
 
@@ -284,19 +345,124 @@ def annotate(
                             )
                         continue
 
-            if len(candidate_labels) == 0:
-                continue
-            elif len(candidate_labels) > 1:
-                warnings.warn(
-                    f"Multiple labels are possible {candidate_labels}. Using first label {candidate_labels[0]}."
-                )
-
             metadata = {
                 "core:freq_lower_edge": freq_lower_edge,
                 "core:freq_upper_edge": freq_upper_edge,
             }
+            if len(candidate_labels) == 0:
+                continue
+            elif len(candidate_labels) == 1: 
+                metadata["core:label"] = candidate_labels[0]
+            elif len(candidate_labels) > 1:
+                # TODO: Add inference on iq samples 
+                if model_file: 
+                    start_model_inference = time.time()
+                    # print(f"{model_file=}")
+                    
+                    # # TODO: get class mapping, load index_to_name.json 
+                    # with open(index_to_name_file) as f:
+                    #     label_to_name = json.load(f)
+                        
+                    # # TODO: load model
+                    # model = torch.jit.load(model_file)
+                    # model = model.to(device)
+                    # model.eval()
 
-            metadata["core:label"] = candidate_labels[0]
+                    # # TODO: define transform 
+                    # # transform = 
+                    # transform = ST.Compose(
+                    #     [
+                    #         # ST.Normalize(norm=2),
+                    #         ST.Normalize(norm=np.inf),
+                    #         ST.ComplexTo2D(),
+                    #     ]
+                    # )
+                    
+                    # print(f"\n{label_to_name=}")
+                    # samples should be shape = (N, 2, 1024)
+                    # print(f"{start=}")
+                    # print(f"{type(iq_samples[start:stop])= }, {iq_samples[start:stop].dtype=}")
+                    
+                    data = iq_samples[start:stop]
+                    # print(f"{np.max(data)=}. {np.min(data)=}")
+                    # print(f"{data.shape=}")
+                    data = data[:model_input_length*int(len(data)/model_input_length)]
+
+
+                    ####
+                    with torch.no_grad():
+                        pre_data = transform(data)
+                        # print(f"\n{pre_data.shape=}")
+                        # print("transform")
+                        pre_data = np.moveaxis(pre_data.T.reshape((-1, model_input_length, 2)), -1, 1)
+                        # print(f"\n{pre_data.shape=}")
+                        # print("preprocess")
+                        # TODO: change to regular pytorch model 
+                        batch_out_jit = model.forward(torch.tensor(pre_data).float().cuda())
+                        # print("batch_out")
+                        batch_out_jit = batch_out_jit.cpu().numpy() if torch.cuda.is_available() else batch_out_jit
+                        # print("batch_out_numpy")
+                        # print(f"{batch_out_jit=}")
+
+                        jit_label_index = np.argmax(batch_out_jit, axis=1).tolist() 
+                        # print(f"{jit_label_index=}")
+
+                        jit_most_likely_label = label_to_name[str(scipy.stats.mode(jit_label_index).mode)]
+                        # print(f"{jit_most_likely_label=}")
+                    #####
+                    # data = data.reshape((int(len(data)/model_input_length), model_input_length))
+                    # for i in range(len(data)):
+                    #     preprocessed = torch.tensor(transform(data[i])).float().cuda().unsqueeze(0)
+                    #     out_jit = model.forward(preprocessed)
+                    #     print(f"{out_jit=}")
+
+                    # # print(f"{data.shape=}")
+                    # preprocessed = transform(data)#.to(device)
+                    # print(f"{preprocessed.shape=}")
+                    # preprocessed = preprocessed.reshape((2, model_input_length, int(len(data)/model_input_length)))
+                    # print(f"{preprocessed.shape=}")
+                    # preprocessed = np.moveaxis(preprocessed, -1, 0)
+                    # print(f"{preprocessed.shape=}")
+                    # with torch.no_grad():
+                    #     preprocessed = torch.tensor(preprocessed).float().to(device)
+                        
+                    #     # preprocessed = torch.reshape(preprocessed, (model_input_length, int(len(data)/model_input_length)))
+                    #     # data = data.reshape(model_input_length, int(len(data)/model_input_length))
+                    #     # print(f"{data.shape=}")
+                    #     # preprocessed = transform(data).to(device)
+                    #     print(f"{preprocessed.shape=}, {torch.min(preprocessed)=}, {torch.max(preprocessed)=}")
+                    #     # pred_tmp = model(preprocessed)
+                    #     pred_tmps = []
+                    #     for i in range(len(preprocessed)):
+                    #         print(f"{preprocessed[i]=}")
+                    #         pred_tmp = model.forward(preprocessed[i].unsqueeze(0)).squeeze()
+                    #         pred_tmp = pred_tmp.cpu().numpy() if torch.cuda.is_available() else pred_tmp
+                    #         pred_tmps.append(pred_tmp)
+                        
+                      
+                    #     # pred_tmp = example_model.predict(data)
+                    #     # pred_tmp = pred_tmp.cpu().numpy() if torch.cuda.is_available() else pred_tmp
+                    # pred_tmps = np.array(pred_tmps)
+                    # print(f"{pred_tmps.shape=}")
+                    # label_predictions = np.argmax(pred_tmps, axis=1).tolist()
+                    # print(f"{label_predictions=}")
+                    # most_likely_label = label_to_name[str(scipy.stats.mode(label_predictions).mode)]
+                    # # most_likely_label = max(set(label_predictions), key=label_predictions.count)
+
+                    metadata["core:label"] = jit_most_likely_label
+                    # print(f"\nrunning inference...")
+                    # print(f"{jit_most_likely_label=}")
+                    # tqdm.write(f"{time.time()-start_model_inference} seconds for model inference")
+
+
+                else:
+                    warnings.warn(
+                        f"Multiple labels are possible {candidate_labels}. Using first label {candidate_labels[0]}."
+                    )
+                    metadata["core:label"] = "?" #candidate_labels[0]
+            
+
+            # metadata["core:label"] = candidate_labels[0]
 
             data_obj.sigmf_obj.add_annotation(
                 int(sample_idx) + start, length=stop - start, metadata=metadata
@@ -307,11 +473,20 @@ def annotate(
 
             n_annotations += 1
 
+        if verbose:
+            tqdm.write(f"annotation writing took {time.time()-start_annotation_time} seconds")
+
+
+
     if not dry_run and n_annotations:
         data_obj.sigmf_obj.tofile(data_obj.sigmf_meta_filename, skip_validate=True)
         print(
             f"Writing {len(data_obj.sigmf_obj._metadata[data_obj.sigmf_obj.ANNOTATION_KEY])} annotations to {data_obj.sigmf_meta_filename}"
         )
+
+    global_end = time.time()
+    data_duration = data_obj.sigmf_obj.sample_count / sample_rate
+    tqdm.write(f"Processing took {global_end-global_start} seconds for a recording of {data_duration} seconds.")
 
 
 def get_bandwidth(
@@ -708,187 +883,381 @@ def reset_annotations(data_obj):
     print(f"Resetting annotations in {data_obj.sigmf_meta_filename}")
 
 
+# default_n_deviations = 1.4826
+default_n_deviations = 0.75
 # MAD estimator
-def median_absolute_deviation(series):
-    mad = 1.4826 * np.median(np.abs(series - np.median(series)))
-    # sci_mad = scipy.stats.median_abs_deviation(series, scale="normal")
-    return np.median(series) + 6 * mad
 
+def median_absolute_deviation(series, n_deviation=default_n_deviations):
+    median_series = np.median(series)
+    deviation = np.median(np.abs(median_series - series))
+    # sci_mad = scipy.stats.median_abs_deviation(series, scale="normal")
+
+    return np.median(series) + (n_deviation * deviation)
+
+
+# ? estimator
+def mean_absolute_deviation_minimum(series, n_deviations = default_n_deviations):
+
+    min_series = np.min(series)
+    deviation = np.mean(np.abs(min_series - series))
+    
+    return min_series + (n_deviations * deviation)
+
+def median_absolute_deviation_minimum(series, n_deviations = default_n_deviations):
+
+    min_series = np.min(series)
+    deviation = np.median(np.abs(min_series - series))
+
+    return min_series + (n_deviations * deviation) 
+    
 
 def debug_plot(
+    iq_samples,
     avg_pwr_db,
     mad,
     threshold_db,
     debug_duration,
     data_obj,
-    guess_threshold_old,
+    heuristic,
     force_threshold_db,
     n_components=None,
+    fft_len=256,
+    madm=None,
+    medadm=None,
 ):
     n_components = n_components if n_components else 3
-
+    sample_rate = data_obj.metadata["global"]["core:sample_rate"]
     print(f"Using threshold = {threshold_db} dB")
 
     ####
     # Figure 1
     ###
-    plt.figure()
-    db_plot = avg_pwr_db[
-        int(0 * data_obj.metadata["global"]["core:sample_rate"]) : int(
-            debug_duration * data_obj.metadata["global"]["core:sample_rate"]
-        )
-    ]
-    plt.plot(
-        np.arange(len(db_plot)) / data_obj.metadata["global"]["core:sample_rate"],
-        db_plot,
-    )
-    plt.axhline(y=guess_threshold_old, color="g", linestyle="-", label="old threshold")
-    plt.axhline(y=np.mean(avg_pwr_db), color="r", linestyle="-", label="average")
-    # plt.axhline(
-    #     y=mad,
-    #     color="b",
-    #     linestyle="-",
-    #     label="median absolute deviation threshold",
+    # plt.figure()
+    # db_plot = avg_pwr_db[
+    #     int(0 * data_obj.metadata["global"]["core:sample_rate"]) : int(
+    #         debug_duration * data_obj.metadata["global"]["core:sample_rate"]
+    #     )
+    # ]
+    # plt.plot(
+    #     np.arange(len(db_plot)) / data_obj.metadata["global"]["core:sample_rate"],
+    #     db_plot,
     # )
-    if force_threshold_db:
-        plt.axhline(
-            y=force_threshold_db,
-            color="yellow",
-            linestyle="-",
-            label="force threshold db",
-        )
-    plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
-    plt.ylabel("dB")
-    plt.xlabel("time (seconds)")
-    plt.title("Signal Power")
-    plt.show()
+    # plt.axhline(y=heuristic, color="g", linestyle="-", label="old threshold")
+    # plt.axhline(y=np.mean(avg_pwr_db), color="r", linestyle="-", label="average")
+    # # plt.axhline(
+    # #     y=mad,
+    # #     color="b",
+    # #     linestyle="-",
+    # #     label="median absolute deviation threshold",
+    # # )
+    # if force_threshold_db:
+    #     plt.axhline(
+    #         y=force_threshold_db,
+    #         color="yellow",
+    #         linestyle="-",
+    #         label="force threshold db",
+    #     )
+    # plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+    # plt.ylabel("dB")
+    # plt.xlabel("time (seconds)")
+    # plt.title("Signal Power")
+    # plt.show()
 
     ###
     # Figure 2
     ###
-    db_plot = avg_pwr_db[
-        int(0 * data_obj.metadata["global"]["core:sample_rate"]) : int(
-            debug_duration * data_obj.metadata["global"]["core:sample_rate"]
-        )
-    ]
-    start_time = time.time()
-    plt.figure()
-    sns.histplot(db_plot, kde=True)
-    plt.xlabel("dB")
-    plt.title(f"Signal Power Histogram & Density ({debug_duration} seconds)")
-    plt.show()
-    print(f"Plot time = {time.time()-start_time}")
+    # db_plot = avg_pwr_db[
+    #     int(0 * data_obj.metadata["global"]["core:sample_rate"]) : int(
+    #         debug_duration * data_obj.metadata["global"]["core:sample_rate"]
+    #     )
+    # ]
+    # start_time = time.time()
+    # plt.figure()
+    # sns.histplot(db_plot, kde=True)
+    # plt.xlabel("dB")
+    # plt.title(f"Signal Power Histogram & Density ({debug_duration} seconds)")
+    # plt.show()
+    # print(f"Plot time = {time.time()-start_time}")
 
-    # fit a Gaussian Mixture Model with two components
-    start_time = time.time()
-    clf = mixture.GaussianMixture(n_components=n_components)
-    clf.fit(db_plot.reshape(-1, 1))
-    print(f"Gaussian mixture model time = {time.time()-start_time}")
-    print(f"{clf.weights_=}")
-    print(f"{clf.means_=}")
-    print(f"{clf.covariances_=}")
-    print(f"{clf.converged_=}")
+    # # fit a Gaussian Mixture Model with two components
+    # start_time = time.time()
+    # clf = mixture.GaussianMixture(n_components=n_components)
+    # clf.fit(db_plot.reshape(-1, 1))
+    # print(f"Gaussian mixture model time = {time.time()-start_time}")
+    # print(f"{clf.weights_=}")
+    # print(f"{clf.means_=}")
+    # print(f"{clf.covariances_=}")
+    # print(f"{clf.converged_=}")
 
     ###
     # Figure 3
     ###
-    db_plot = avg_pwr_db
-    start_time = time.time()
-    plt.figure()
-    sns.histplot(db_plot, kde=True)
-    plt.xlabel("dB")
-    plt.title(f"Signal Power Histogram & Density")
-    plt.show()
-    print(f"Plot time = {time.time()-start_time}")
+    # db_plot = avg_pwr_db
+    # start_time = time.time()
+    # plt.figure()
+    # sns.histplot(db_plot, kde=True)
+    # plt.xlabel("dB")
+    # plt.title(f"Signal Power Histogram & Density")
+    # plt.show()
+    # print(f"Plot time = {time.time()-start_time}")
 
-    # fit a Gaussian Mixture Model with two components
-    start_time = time.time()
-    clf = mixture.GaussianMixture(n_components=n_components)
-    clf.fit(db_plot.reshape(-1, 1))
-    print(f"Gaussian mixture model time = {time.time()-start_time}")
-    print(f"{clf.weights_=}")
-    print(f"{clf.means_=}")
-    print(f"{clf.covariances_=}")
-    print(f"{clf.converged_=}")
+    # # fit a Gaussian Mixture Model with two components
+    # start_time = time.time()
+    # clf = mixture.GaussianMixture(n_components=n_components)
+    # clf.fit(db_plot.reshape(-1, 1))
+    # print(f"Gaussian mixture model time = {time.time()-start_time}")
+    # print(f"{clf.weights_=}")
+    # print(f"{clf.means_=}")
+    # print(f"{clf.covariances_=}")
+    # print(f"{clf.converged_=}")
 
     ###
     # Figure 4
     ###
-    plt.figure()
-    db_plot = avg_pwr_db[
-        int(0 * data_obj.metadata["global"]["core:sample_rate"]) : int(
-            debug_duration * data_obj.metadata["global"]["core:sample_rate"]
-        )
-    ]
-    plt.plot(
-        np.arange(len(db_plot)) / data_obj.metadata["global"]["core:sample_rate"],
-        db_plot,
-    )
-    plt.axhline(y=guess_threshold_old, color="g", linestyle="-", label="old threshold")
-    plt.axhline(y=np.mean(avg_pwr_db), color="r", linestyle="-", label="average")
-    # plt.axhline(
-    #     y=mad,
-    #     color="b",
-    #     linestyle="-",
-    #     label="median absolute deviation threshold",
+    # plt.figure()
+    # db_plot = avg_pwr_db[
+    #     int(0 * data_obj.metadata["global"]["core:sample_rate"]) : int(
+    #         debug_duration * data_obj.metadata["global"]["core:sample_rate"]
+    #     )
+    # ]
+    # plt.plot(
+    #     np.arange(len(db_plot)) / data_obj.metadata["global"]["core:sample_rate"],
+    #     db_plot,
     # )
-    plt.axhline(
-        y=np.min(clf.means_)
-        + 3 * np.sqrt(clf.covariances_[np.argmin(clf.means_)].squeeze()),
-        color="yellow",
-        linestyle="-",
-        label="gaussian mixture model estimate",
-    )
-    if force_threshold_db:
-        plt.axhline(
-            y=force_threshold_db,
-            color="yellow",
-            linestyle="-",
-            label="force threshold db",
-        )
-    plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
-    plt.ylabel("dB")
-    plt.xlabel("time (seconds)")
-    plt.title("Signal Power")
-    plt.show()
+    # plt.axhline(y=heuristic, color="g", linestyle="-", label="old threshold")
+    # plt.axhline(y=np.mean(avg_pwr_db), color="r", linestyle="-", label="average")
+    # # plt.axhline(
+    # #     y=mad,
+    # #     color="b",
+    # #     linestyle="-",
+    # #     label="median absolute deviation threshold",
+    # # )
+    # plt.axhline(
+    #     y=np.min(clf.means_)
+    #     + 3 * np.sqrt(clf.covariances_[np.argmin(clf.means_)].squeeze()),
+    #     color="yellow",
+    #     linestyle="-",
+    #     label="gaussian mixture model estimate",
+    # )
+    # if force_threshold_db:
+    #     plt.axhline(
+    #         y=force_threshold_db,
+    #         color="yellow",
+    #         linestyle="-",
+    #         label="force threshold db",
+    #     )
+    # plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+    # plt.ylabel("dB")
+    # plt.xlabel("time (seconds)")
+    # plt.title("Signal Power")
+    # plt.show()
+
+    
+
 
     ###
-    # Figure 5
+    # Figure 6
     ###
-    plt.figure()
+
+    # f, t, Sxx = scipy.signal.spectrogram(
+    #     iq_samples,
+    #     fs=sample_rate,
+    #     return_onesided=False,
+    #     scaling="spectrum",
+    #     mode="psd",
+    #     detrend=False,
+    #     noverlap=0,
+    #     window=scipy.signal.windows.boxcar(fft_len),
+    # )
+    # plt.figure()
+    # # plt.pcolormesh(t, f, 10*np.log10(Sxx))
+    # plt.pcolormesh(t, scipy.fft.fftshift(f), 10*np.log10(scipy.fft.fftshift(Sxx, axes=0)), shading='gouraud')
+    # # plt.imshow(10 * np.log10(scipy.fft.fftshift(Sxx, axes=0)), origin="lower")
+    # plt.colorbar()
+    # plt.title("Method 1, scaling=spectrum, mode=psd")
+    # plt.show()
+
+    ###
+    # Figure 6
+    ###
+    # plt.figure()
+    # # plt.pcolormesh(t, f, 10*np.log10(Sxx))
+    # plt.plot(np.min(10 * np.log10(scipy.fft.fftshift(Sxx, axes=0)), axis=0), label="min")
+    # plt.plot(np.median(10 * np.log10(scipy.fft.fftshift(Sxx, axes=0)), axis=0), label="median")
+    # plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+    # plt.title("Method 1, scaling=spectrum, mode=psd")
+    # plt.show()
+
+    ###
+    # Figure 7
+    ###
+    filter_window = 2000
+    Y = []
+    avg_min = []
+    median_min = []
+    min_min = []
+    mins = []
+    medians = []
+    for i in range(int(len(iq_samples)/fft_len)):
+        X = scipy.fft.fft(iq_samples[i*fft_len:(i+1)*fft_len])
+        # X = np.abs(X)**2
+        X = 10 * np.log10(np.abs(X)**2)
+        Y.append(np.min(X))
+        mins.append(np.min(X))
+        medians.append(np.median(X))
+        if len(Y) > filter_window:
+            Y.pop(0)
+        avg_min.append(np.mean(Y))
+        median_min.append(np.median(Y))
+        min_min.append(np.min(Y))
 
     db_plot = avg_pwr_db
+    print(f"{len(db_plot)=} vs {len(medians)=}")
+
+
+
+    
+    plt.figure()
+    
+    # plt.plot(medians, label="median FFT")
+    # plt.plot(mins, label="min FFT")
+    print(f"{len(avg_min)=}, {len(median_min)=}, {len(avg_pwr_db)=}")
     plt.plot(
-        np.arange(len(db_plot)) / data_obj.metadata["global"]["core:sample_rate"],
-        db_plot,
+        np.arange(len(avg_min)) / data_obj.metadata["global"]["core:sample_rate"],
+        10*np.log10((10**(np.array(avg_min)/10))), 
+        label="avg_min"
     )
-    plt.axhline(y=guess_threshold_old, color="g", linestyle="-", label="old threshold")
-    plt.axhline(y=np.mean(avg_pwr_db), color="r", linestyle="-", label="average")
+    plt.plot(
+        np.arange(len(median_min)) / data_obj.metadata["global"]["core:sample_rate"],
+        10*np.log10((10**(np.array(median_min)/10))), 
+        label="median_min"
+    )
+    plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+
+    plt.show()
+
+    plt.figure()
+    # plt.plot(
+    #     np.arange(len(min_min)) / data_obj.metadata["global"]["core:sample_rate"],
+    #     10*np.log10((10**(np.array(min_min)/10))), 
+    #     label="min_min"
+    # )
+    plt.plot(
+        np.arange(len(avg_pwr_db)) / data_obj.metadata["global"]["core:sample_rate"],
+        avg_pwr_db,
+        label="avg power"
+    )
+    plt.axhline(
+        y=mad,
+        color="brown",
+        linestyle="-",
+        label="median absolute deviation ",
+    )
+    plt.axhline(
+        y=madm,
+        color="gray",
+        linestyle="-",
+        label="mean absolute deviation minimum",
+    )
+    plt.axhline(
+        y=medadm,
+        color="purple",
+        linestyle="-",
+        label="median absolute deviation minimum",
+    )
+    plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+    plt.title("avg_min")
+    plt.show()
+
+
+    # def sliding_min(data, window_length):
+    #     window = []
+    #     mins = []
+    #     for i in tqdm(range(len(data))):
+    #         window.append(data[i])
+    #         if len(window) > window_length:
+    #             window.pop(0)
+            
+    #         if i % fft_len == 0: 
+    #             current_min = np.min(window)
+    #         # print(f"{i=}, {current_min=}")
+    #         mins.append(current_min)
+    #     return mins
+    
+
+    # def moving_average_basic(data, avg_window_len):
+    #     return (
+    #         np.convolve(data, np.ones(avg_window_len), "valid")
+    #         / avg_window_len
+    #     )
+    # ###
+    # # Figure 5
+    # ###
+    # plt.figure()
+    # print("here")
+    # db_plot = avg_pwr_db
+    # plt.plot(
+    #     np.arange(len(db_plot)) / data_obj.metadata["global"]["core:sample_rate"],
+    #     db_plot,
+    #     label="average power"
+    # )
+    # slide_min = sliding_min(db_plot, 1024*80)
+    # slide_avg_min = moving_average_basic(slide_min, 1024*40)
+    # print(f"{len(slide_min)=} vs {len(db_plot)=} vs {len(slide_avg_min)=}")
+    # # plt.plot(
+    # #     np.arange(len(db_plot)) / data_obj.metadata["global"]["core:sample_rate"],
+    # #     slide_min, 
+    # #     label="sliding min"
+    # # )
+    # plt.plot(
+    #     np.arange(len(slide_avg_min)) / data_obj.metadata["global"]["core:sample_rate"],
+    #     slide_avg_min, 
+    #     label="sliding avg min"
+    # )
+    # # plt.axhline(y=heuristic, color="g", linestyle="-", label="old threshold")
+    # # plt.axhline(y=np.mean(avg_pwr_db), color="r", linestyle="-", label="average")
     # plt.axhline(
     #     y=mad,
-    #     color="b",
+    #     color="brown",
     #     linestyle="-",
-    #     label="median absolute deviation threshold",
+    #     label="median absolute deviation ",
     # )
-    plt.axhline(
-        y=np.min(clf.means_)
-        + 3 * np.sqrt(clf.covariances_[np.argmin(clf.means_)].squeeze()),
-        color="yellow",
-        linestyle="-",
-        label="gaussian mixture model estimate",
-    )
-    if force_threshold_db:
-        plt.axhline(
-            y=force_threshold_db,
-            color="yellow",
-            linestyle="-",
-            label="force threshold db",
-        )
-    plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
-    plt.ylabel("dB")
-    plt.xlabel("time (seconds)")
-    plt.title("Signal Power")
-    plt.show()
+    # plt.axhline(
+    #     y=madm,
+    #     color="gray",
+    #     linestyle="-",
+    #     label="mean absolute deviation minimum",
+    # )
+    # plt.axhline(
+    #     y=medadm,
+    #     color="purple",
+    #     linestyle="-",
+    #     label="median absolute deviation minimum",
+    # )
+    
+    # # plt.axhline(
+    # #     y=np.min(clf.means_)
+    # #     + 3 * np.sqrt(clf.covariances_[np.argmin(clf.means_)].squeeze()),
+    # #     color="yellow",
+    # #     linestyle="-",
+    # #     label="gaussian mixture model estimate",
+    # # )
+    # if force_threshold_db:
+    #     plt.axhline(
+    #         y=force_threshold_db,
+    #         # color="yellow",
+    #         linestyle="-",
+    #         label="force threshold db",
+    #     )
+    # plt.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+    # plt.ylabel("dB")
+    # plt.xlabel("time (seconds)")
+    # plt.title("Signal Power")
+    # plt.show()
+        
+
+
+
 
 
 def reset_predictions_sigmf(dataset):

@@ -16,23 +16,23 @@ def argument_parser():
         "--checkpoint", type=str, help="Path to the model checkpoint", required=True
     )
     parser.add_argument(
+        "--index_to_name",
+        type=str,
+        required=True,
+        help="Path of JSON file defining mapping of label index to name.",
+    )
+    parser.add_argument(
         "--mode",
         type=str,
         choices=["export, convert"],
         default="export",
-        help="Whether to convert model to torchserve/torchscript or export to MAR. 'export' will automatically convert the checkpoint and export to MAR. (default: %(default)s)",
+        help="Whether to convert model to state dict/torchscript or export to MAR. 'export' will automatically convert the checkpoint and export to MAR. (default: %(default)s)",
     )
     parser.add_argument(
         "--custom_handler",
         type=str,
         default="custom_handlers/iq_custom_handler.py",
         help="Custom handler to use when exporting to MAR. Only used if --mode='export'. (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--index_to_name",
-        type=str,
-        required=True,
-        help="Path of JSON file defining mapping of label index to name.",
     )
     parser.add_argument(
         "--export_path",
@@ -57,8 +57,8 @@ def convert_model(model_name, checkpoint):
     if not os.path.exists("weights"):
         os.makedirs("weights")
 
-    torch.save(model_weights, f"weights/{model_name}_torchserve.pt")
-    print(f"Saved model weights to weights/{model_name}_torchserve.pt")
+    torch.save(model_weights, f"weights/{model_name}_state_dict.pt")
+    print(f"Saved model weights to weights/{model_name}_state_dict.pt")
 
     model = efficientnet_b0(num_classes=num_classes)
 

@@ -80,6 +80,9 @@ class TorchsigHandler(BaseHandler):
         self.avg_db_historical = 0
         self.max_db = None
 
+        self.annotation_count = 0
+        self.preprocess_count = 0
+
     def add_to_avg(self, value):
         self.avg_db_historical = (self.avg_db_historical * self.avg_size + value) / (
             self.avg_size + 1
@@ -144,19 +147,27 @@ class TorchsigHandler(BaseHandler):
                     "Install torch>=1.8.1 to use profiler."
                 )
         else:
+            print(f"1) {type(data)=}, {len(data)=}")
             if self._is_describe():
                 output = [self.describe_handle()]
-            elif self.gate(data):
-                print(f"\n NO SIGNAL \n")
-                output = [{"No signal": None}]
+            # elif self.gate(data):
+            #     # print(f"\n NO SIGNAL \n")
+            #     output = [{"No signal": None}]
             else:
                 data_preprocess = self.preprocess(data)
-
-                if not self._is_explain():
+                if data_preprocess is None:
+                    output = [{"No signal": None}]
+                elif self._is_explain():
+                    output = self.explain_handle(data_preprocess, data)
+                else:
                     output = self.inference(data_preprocess)
                     output = self.postprocess(output)
-                else:
-                    output = self.explain_handle(data_preprocess, data)
+
+                # if not self._is_explain():
+                #     output = self.inference(data_preprocess)
+                #     output = self.postprocess(output)
+                # else:
+                #     output = self.explain_handle(data_preprocess, data)
 
         stop_time = time.time()
         metrics.add_time(
@@ -164,39 +175,40 @@ class TorchsigHandler(BaseHandler):
         )
         return output
 
-    def gate(self, data):
-        """
-        Gates input data for inference
-        :param data: list of raw requests, should match batch size
-        :return: bool True if gate input, False if for inference
-        """
-        try:
-            body = data[0]["body"]
-        except (KeyError, IndexError) as exc:
-            print("could not parse body from request: ", data)
-            raise ValueError from exc
+    # def gate(self, data):
+    #     """
+    #     Gates input data for inference
+    #     :param data: list of raw requests, should match batch size
+    #     :return: bool True if gate input, False if for inference
+    #     """
+    #     print(f"Gate: {type(data)=}, {data=}")
+    #     try:
+    #         body = data[0]["body"]
+    #     except (KeyError, IndexError) as exc:
+    #         print("could not parse body from request: ", data)
+    #         raise ValueError from exc
 
-        data = torch.tensor(np.frombuffer(body, dtype=np.complex64), dtype=torch.cfloat)
+    #     data = torch.tensor(np.frombuffer(body, dtype=np.complex64), dtype=torch.cfloat)
 
-        avg_pwr = 10 * torch.log10(torch.mean(torch.abs(data) ** 2))
-        if self.max_db is None or self.max_db < avg_pwr:
-            self.max_db = avg_pwr
+    #     avg_pwr = 10 * torch.log10(torch.mean(torch.abs(data) ** 2))
+    #     if self.max_db is None or self.max_db < avg_pwr:
+    #         self.max_db = avg_pwr
 
-        self.add_to_avg(avg_pwr)
+    #     self.add_to_avg(avg_pwr)
 
-        print("\n=====================================")
-        print("=====================================\n")
-        print(f"GATE")
-        print(f"\n{data.shape=}\n")
-        print(f"\n{avg_pwr=}, \n{self.max_db=}, \n{self.avg_db_historical=}\n")
-        print(f"\n{torch.min(torch.abs(data)**2)=}, {torch.max(torch.abs(data)**2)=}\n")
-        print("\n=====================================")
-        print("=====================================")
+    #     print("\n=====================================")
+    #     print("=====================================\n")
+    #     print(f"GATE")
+    #     print(f"\n{data.shape=}\n")
+    #     print(f"\n{avg_pwr=}, \n{self.max_db=}, \n{self.avg_db_historical=}\n")
+    #     print(f"\n{torch.min(torch.abs(data)**2)=}, {torch.max(torch.abs(data)**2)=}\n")
+    #     print("\n=====================================")
+    #     print("=====================================")
 
-        if avg_pwr > (self.max_db + self.avg_db_historical) / 2:
-            return False
+    #     if avg_pwr > (self.max_db + self.avg_db_historical) / 2:
+    #         return False
 
-        return True
+    #     return True
 
     def preprocess(self, data):
         """
@@ -204,28 +216,71 @@ class TorchsigHandler(BaseHandler):
         :param data: list of raw requests, should match batch size
         :return: list of preprocessed model input data
         """
+
+        self.preprocess_count += 1
+        print(f"{self.preprocess_count=}, time = {1024*self.preprocess_count/20e6}")
+        # load data 
         try:
             body = data[0]["body"]
         except (KeyError, IndexError) as exc:
             print("could not parse body from request: ", data)
             raise ValueError from exc
-
         data = torch.tensor(np.frombuffer(body, dtype=np.complex64), dtype=torch.cfloat)
-        print("\n=====================================\n")
-        print(f"PREPROCESS")
-        print(f"\n{data=}\n")
-        print(f"\n{torch.min(torch.abs(data)**2)=}, {torch.max(torch.abs(data)**2)=}\n")
+
+        # if iq_inference_power
+        iq_samples = data[:1024]
+        fft_coeff = data[1024:]
+        # else
+        # iq_samples = data
+
+
+        # GATE #
+        avg_pwr = 10 * torch.log10(torch.mean(torch.abs(iq_samples) ** 2))
+        if self.max_db is None or self.max_db < avg_pwr:
+            self.max_db = avg_pwr
+
+        self.add_to_avg(avg_pwr)
+
+        print("\n=====================================")
+        print("=====================================\n")
+        print(f"PREPROCESS (GATE)")
+        print(f"{self.preprocess_count=}, time = {1024*self.preprocess_count/20e6}")
+        # print(f"\n{iq_samples.shape=}, {iq_samples=}\n")
+        # print(f"\n{fft_coeff.shape=}, {fft_coeff=}\n")
+        # print(f"\n{avg_pwr=}, \n{self.max_db=}, \n{self.avg_db_historical=}\n")
+        # print(f"\n{torch.min(torch.abs(data)**2)=}, {torch.max(torch.abs(data)**2)=}\n")
+        print("\n=====================================")
+        print("=====================================")
+
+        if avg_pwr <= (self.max_db + self.avg_db_historical) / 2:
+            return None
+
+
+        # GATE #
+
+        
         avg_pwr = torch.mean(torch.abs(data) ** 2)
         avg_pwr_db = 10 * torch.log10(avg_pwr)
-        print(f"\n{avg_pwr=}\n")
-        print(f"\n{avg_pwr_db=}\n")
+        
         data = data * 1 / torch.norm(data, float("inf"), keepdim=True)
         data = torch.view_as_real(data)
         data = torch.movedim(data, -1, 0).unsqueeze(0)
+
+        print(f"{data.shape=}")
         # data should be of size (N, 2, n_samples)
 
         data = data.to(self.device)
-        print("\n=====================================")
+
+
+        # print("\n=====================================")
+        # print("=====================================\n")
+        # print(f"PREPROCESS")
+        # print(f"\n{data=}\n")
+        # print(f"\n{torch.min(torch.abs(data)**2)=}, {torch.max(torch.abs(data)**2)=}\n")
+        # print(f"\n{avg_pwr=}\n")
+        # print(f"\n{avg_pwr_db=}\n")
+        # print("\n=====================================")
+        # print("=====================================")
         return data
 
     def inference(self, model_input):
@@ -244,10 +299,9 @@ class TorchsigHandler(BaseHandler):
         :param inference_output: list of inference output
         :return: list of predict results
         """
-        print("\n=====================================\n")
-        print(f"POSTPROCESS")
+        
         # print(f"{self.mapping=}")
-
+        self.annotation_count += len(inference_output.data)
         confidences, class_indexes = torch.max(inference_output.data, 1)
         results = {
             self.mapping[str(class_index)]: [{"confidence": confidence}]
@@ -255,6 +309,10 @@ class TorchsigHandler(BaseHandler):
                 class_indexes.tolist(), confidences.tolist()
             )
         }
-        print(f"\n{inference_output=}\n{results=}\n")
+        # print(f"\n{inference_output=}\n{results=}\n")
+
+        print("\n=====================================\n")
+        print(f"POSTPROCESS")
+        print(f"cumulative annotation count = {self.annotation_count}, predictions = {list(results.keys())}")
         print("\n=====================================")
         return [results]

@@ -410,6 +410,128 @@ def train_iq(
         "models/",
     )
 
+def validate_iq(checkpoint_path, dataset_path, num_iq_samples, transform, only_use_start_of_burst, index_to_name_file, batch_size):
+    with open(index_to_name_file) as f:
+        index_to_name = json.load(f)
+
+    class_list = [index_to_name[str(i)] for i in range(len(index_to_name))]
+
+    checkpoint = torch.load(
+        checkpoint_path, map_location=lambda storage, loc: storage
+    )
+    model = efficientnet_b0(
+        pretrained=True,
+        path="efficientnet_b0.pt",
+        num_classes=len(class_list),
+        drop_path_rate=0.4,
+        drop_rate=0.4,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+
+    
+    val_dataset = SigMFDataset(
+        root=dataset_path,
+        sample_count=num_iq_samples,
+        transform=transform,
+        only_first_samples=only_use_start_of_burst,
+        class_list=class_list,
+    )
+
+    print(val_dataset[0])
+    signal_capture, target = val_dataset.get_signal(0)
+    print(f"{signal_capture.num_samples=}, {signal_capture.item_type.itemsize=}, {signal_capture.byte_offset// signal_capture.item_type.itemsize/2=}, {signal_capture.signal_description.upper_frequency=}, {signal_capture.signal_description.lower_frequency=}")
+
+    signal_capture, target = val_dataset.get_signal(1)
+    print(f"{signal_capture.num_samples=}, {signal_capture.item_type.itemsize=}, {signal_capture.byte_offset// signal_capture.item_type.itemsize/2=}, {signal_capture.signal_description.upper_frequency=}, {signal_capture.signal_description.lower_frequency=}")
+    val_dataloader = DataLoader(
+        dataset=val_dataset,
+        batch_size=batch_size,
+        num_workers=24,
+        shuffle=False,
+        drop_last=True,
+    )
+
+    model = model.to(device)
+
+    example_model = ExampleNetwork(
+        model,
+        val_dataloader,
+        val_data_loader=val_dataloader,
+        num_classes=len(class_list),
+        logs_dir="./foo",
+        learning_rate=0.0001,
+        class_list=class_list,
+    )
+    example_model.load_state_dict(checkpoint["state_dict"], strict=False)
+    example_model = example_model.eval()
+    example_model = example_model.cuda() if torch.cuda.is_available() else example_model
+    
+
+    jit_model = torch.jit.load("/home/ltindall/iqt/rfml/weights/apartment_experiment_torchscript.pt")
+    jit_model = jit_model.to(device)
+    jit_model.eval()
+
+    # Infer results over validation set
+    num_test_examples = len(val_dataset)
+    y_preds = np.zeros((num_test_examples,))
+    y_true = np.zeros((num_test_examples,))
+    y_true_list = []
+    y_preds_list = []
+
+    with torch.no_grad():
+        example_model.eval()
+        for data, label in tqdm(val_dataloader):
+            # Retrieve data
+            # idx = i # Use index if evaluating over full dataset
+            # data, label = val_dataset[idx]
+            # Infer
+            data = data.float()
+            # data = torch.from_numpy(data).float()
+            # data = torch.from_numpy(np.expand_dims(data,0)).float()
+            data = data.cuda() if torch.cuda.is_available() else data
+            print(f"{data.shape=}")
+            print(f"{torch.min(data)=}, {torch.max(data)=}")
+            jit_pred = jit_model.forward(data)
+            pred_tmp = example_model.predict(data)
+            print(f"{jit_pred=}, {pred_tmp=}")
+            pred_tmp = pred_tmp.cpu().numpy() if torch.cuda.is_available() else pred_tmp
+            print(f"{pred_tmp=}")
+            y_preds_list.extend(np.argmax(pred_tmp, axis=1).tolist())
+            y_true_list.extend(label.tolist())
+            # # Argmax
+            # y_preds[i] = np.argmax(pred_tmp)
+            # # Store label
+            # y_true[i] = label
+
+    y_preds = y_preds_list
+    y_true = y_true_list
+
+    acc = np.sum(np.asarray(y_preds) == np.asarray(y_true)) / len(y_true)
+
+    y_to_plot = sorted(list(set(y_true) | set(y_preds)))
+    classes_to_plot = [index_to_name[str(y)] for y in y_to_plot]
+
+    # plot_confusion_matrix(
+    #     y_true,
+    #     y_preds,
+    #     classes=classes_to_plot,  # class_list,
+    #     normalize=True,
+    #     title="Example Modulations Confusion Matrix\nTotal Accuracy: {:.2f}%".format(
+    #         acc * 100
+    #     ),
+    #     text=True,
+    #     rotate_x_text=90,
+    #     figsize=(16, 9),
+    # )
+    # # plt.show()
+    # plt.savefig(Path(logs_dir, "confusion_matrix.png"))
+
+    print(f"\n\nI/Q TRAINING COMPLETE\n\n")
+    # print(f"Find results in {str(Path(logs_dir))}\n")
+    print(f"Total Accuracy: {acc*100:.2f}%")
+    # print(f"Best Model Checkpoint: {checkpoint_callback.best_model_path}")
+
 
 def visualize_dataset(
     dataset_path,

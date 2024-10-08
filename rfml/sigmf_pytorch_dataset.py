@@ -130,14 +130,24 @@ class SigMFDataset(SignalDataset):
         target, signal_capture = self.index[item]
         signal_data = self.get_data(signal_capture)
 
+        # print(f"{np.min(signal_data)=}, {np.max(signal_data)=}")
         if self.transform:
             signal_data = self.transform(signal_data)
 
         if self.target_transform:
             target = self.target_transform(target)
+        
+        n_seek_samples = int(signal_capture.byte_offset/signal_capture.item_type.itemsize/2)
+        n_samples = int(signal_capture.num_bytes/signal_capture.item_type.itemsize/2)
+        # print(f"\n{signal_capture.num_bytes=}, {signal_capture.byte_offset=}, {signal_capture.item_type.itemsize}")
+        # print(f"\nn_samples = {signal_capture.num_bytes/signal_capture.item_type.itemsize/2}, seek_samples = {signal_capture.byte_offset/signal_capture.item_type.itemsize/2}")
+        return signal_data.iq_data, target, n_seek_samples, n_samples  # type: ignore
 
-        return signal_data.iq_data, target  # type: ignore
+    def get_signal(self, item):
+        target, signal_capture = self.index[item]
 
+        return signal_capture, target 
+    
     def __len__(self) -> int:
         return len(self.index)
 
